@@ -23,8 +23,31 @@ target_sources(${PROJECT_NAME} PRIVATE
 
 
 if(BUILD_OUT_OF_TREE)
-	find_package(libobs REQUIRED)
-	find_package(obs-frontend-api REQUIRED)
+	find_package(libobs CONFIG QUIET)
+	if(NOT TARGET OBS::libobs)
+		find_package(LibObs CONFIG QUIET)
+		if(TARGET libobs AND NOT TARGET OBS::libobs)
+			add_library(OBS::libobs INTERFACE IMPORTED)
+			target_link_libraries(OBS::libobs INTERFACE libobs)
+		endif()
+	endif()
+	if(NOT TARGET OBS::libobs)
+		message(FATAL_ERROR "Could not find a usable libobs CMake target (expected OBS::libobs or libobs).")
+	endif()
+
+	find_package(obs-frontend-api CONFIG QUIET)
+	if(NOT TARGET OBS::obs-frontend-api)
+		find_library(OBS_FRONTEND_API_LIBRARY NAMES obs-frontend-api REQUIRED)
+		find_path(OBS_FRONTEND_API_INCLUDE_DIR
+			NAMES obs-frontend-api.h
+			PATH_SUFFIXES obs
+			REQUIRED)
+		add_library(OBS::obs-frontend-api UNKNOWN IMPORTED)
+		set_target_properties(OBS::obs-frontend-api PROPERTIES
+			IMPORTED_LOCATION "${OBS_FRONTEND_API_LIBRARY}"
+			INTERFACE_INCLUDE_DIRECTORIES "${OBS_FRONTEND_API_INCLUDE_DIR}")
+	endif()
+
 	include(cmake/ObsPluginHelpers.cmake)
 	set(OBS_FRONTEND_API_NAME "obs-frontend-api")
 else()

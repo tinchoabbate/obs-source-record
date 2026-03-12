@@ -32,7 +32,7 @@ function Setup-Host {
             $_Hash = $BuildSpec.dependencies."${_Dependency}".hashes."windows-${script:Target}"
 
             if ( $BuildSpec.dependencies."${_Dependency}".PSobject.Properties.Name -contains "pdb-hashes" ) {
-                $_PdbHash = $BuildSpec.dependencies."${_Dependency}".'pdb-hashes'."$windows-${script:Target}"
+                $_PdbHash = $BuildSpec.dependencies."${_Dependency}".'pdb-hashes'."windows-${script:Target}"
             }
 
             if ( $_Version -eq '' ) {

@@ -21,8 +21,14 @@
 #define BACKGROUND_CHANNEL 0
 #define SOURCE_CHANNEL 1
 
+#ifndef OBS_TEXT_INFO
+#define OBS_TEXT_INFO OBS_TEXT_DEFAULT
+#endif
+
 struct source_record_filter_context {
 	obs_source_t *source;
+	obs_weak_source_t *parent_source;
+	obs_source_t *background_source;
 	video_t *video_output;
 	audio_t *audio_output;
 	bool output_active;
@@ -60,6 +66,144 @@ struct source_record_filter_context {
 
 DARRAY(obs_source_t *) source_record_filters;
 
+static const char *(*obs_frontend_get_locale_string_func)(const char *) = NULL;
+static video_t *(*obs_view_add2_func)(obs_view_t *view, const struct obs_video_info *ovi) = NULL;
+static void (*obs_view_remove_func)(obs_view_t *view) = NULL;
+
+/* Compatibility shim: falls back to module locale keys on older OBS builds. */
+static const char *source_record_get_locale_string(const char *key)
+{
+	if (obs_frontend_get_locale_string_func) {
+		const char *locale_string = obs_frontend_get_locale_string_func(key);
+		if (locale_string && strlen(locale_string))
+			return locale_string;
+	}
+	return obs_module_text(key);
+}
+
+/*
+ * Compatibility shim for per-view video outputs.
+ * On older OBS builds this API is missing; fallback keeps plugin buildable.
+ */
+static video_t *source_record_view_add(obs_view_t *view, const struct obs_video_info *ovi)
+{
+	if (obs_view_add2_func)
+		return obs_view_add2_func(view, ovi);
+	UNUSED_PARAMETER(view);
+	UNUSED_PARAMETER(ovi);
+	return obs_get_video();
+}
+
+/* Compatibility shim for view teardown on older OBS builds. */
+static void source_record_view_remove(obs_view_t *view)
+{
+	if (obs_view_remove_func)
+		obs_view_remove_func(view);
+}
+
+struct filter_parent_lookup {
+	obs_source_t *filter;
+	obs_source_t *parent;
+};
+
+/* Enum callback: capture the first parent that owns the requested filter. */
+static void find_filter_parent(obs_source_t *parent, obs_source_t *child, void *param)
+{
+	struct filter_parent_lookup *lookup = param;
+	if (lookup->parent || child != lookup->filter)
+		return;
+	lookup->parent = obs_source_get_ref(parent);
+}
+
+/* Enumerates source filters to find a parent for a specific filter source. */
+static bool find_parent_source(void *data, obs_source_t *source)
+{
+	struct filter_parent_lookup *lookup = data;
+	if (lookup->parent)
+		return false;
+	obs_source_enum_filters(source, find_filter_parent, lookup);
+	return lookup->parent == NULL;
+}
+
+/*
+ * Slow path parent resolution used outside OBS-safe filter callback contexts.
+ * Returns a strong reference; caller must release.
+ */
+static obs_source_t *find_filter_parent_ref(obs_source_t *filter)
+{
+	if (!filter)
+		return NULL;
+
+	struct filter_parent_lookup lookup = {
+		.filter = filter,
+		.parent = NULL,
+	};
+
+	obs_enum_sources(find_parent_source, &lookup);
+	if (!lookup.parent)
+		obs_enum_scenes(find_parent_source, &lookup);
+
+	return lookup.parent;
+}
+
+/* Refreshes cached weak parent reference when parent ownership changes. */
+static void update_parent_weak_ref(struct source_record_filter_context *context, obs_source_t *parent)
+{
+	obs_source_t *existing = NULL;
+	if (context->parent_source)
+		existing = obs_weak_source_get_source(context->parent_source);
+
+	if (existing == parent) {
+		if (existing)
+			obs_source_release(existing);
+		return;
+	}
+
+	if (existing)
+		obs_source_release(existing);
+
+	if (context->parent_source) {
+		obs_weak_source_release(context->parent_source);
+		context->parent_source = NULL;
+	}
+
+	if (parent)
+		context->parent_source = obs_source_get_weak_source(parent);
+}
+
+/*
+ * Fast parent lookup used on hot paths (audio thread): no enumeration fallback.
+ * Returns a strong reference when available.
+ */
+static obs_source_t *get_parent_source_ref_cached(struct source_record_filter_context *context)
+{
+	if (context->parent_source) {
+		obs_source_t *parent = obs_weak_source_get_source(context->parent_source);
+		if (parent && !obs_source_removed(parent))
+			return parent;
+		if (parent)
+			obs_source_release(parent);
+		obs_weak_source_release(context->parent_source);
+		context->parent_source = NULL;
+	}
+
+	return NULL;
+}
+
+/* Parent lookup for normal code paths with cached weak-ref + enum fallback. */
+static obs_source_t *get_parent_source_ref(struct source_record_filter_context *context)
+{
+	obs_source_t *parent = get_parent_source_ref_cached(context);
+	if (parent)
+		return parent;
+
+	parent = find_filter_parent_ref(context->source);
+	if (parent)
+		update_parent_weak_ref(context, parent);
+	return parent;
+}
+
+/* Queues a task on the opposite task thread to avoid re-entrancy issues. */
 static void run_queued(obs_task_t task, void *param)
 {
 	if (obs_in_task_thread(OBS_TASK_UI)) {
@@ -105,6 +249,7 @@ static void calc_min_ts(obs_source_t *parent, obs_source_t *child, void *param)
 		*min_ts = ts;
 }
 
+/* Mixes child audio into a pre-zeroed output mix buffer at the right offset. */
 static void mix_audio(obs_source_t *parent, obs_source_t *child, void *param)
 {
 	UNUSED_PARAMETER(parent);
@@ -134,6 +279,11 @@ static void mix_audio(obs_source_t *parent, obs_source_t *child, void *param)
 	}
 }
 
+/*
+ * Audio callback for "different audio" = disabled path.
+ * Pitfall: runs on audio thread, so it must avoid expensive lookups and
+ * only use stable refs while reading source state.
+ */
 static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end_ts_in, uint64_t *out_ts, uint32_t mixers,
 				 struct audio_output_data *mixes)
 {
@@ -147,13 +297,13 @@ static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end
 	obs_source_t *audio_source = NULL;
 	if (filter->audio_source) {
 		audio_source = obs_weak_source_get_source(filter->audio_source);
-		if (audio_source)
-			obs_source_release(audio_source);
 	} else {
-		audio_source = obs_filter_get_parent(filter->source);
+		audio_source = get_parent_source_ref_cached(filter);
 	}
 	if (!audio_source || obs_source_removed(audio_source)) {
 		*out_ts = start_ts_in;
+		if (audio_source)
+			obs_source_release(audio_source);
 		return true;
 	}
 
@@ -192,21 +342,27 @@ static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end
 		} else {
 			*out_ts = start_ts_in;
 		}
+		obs_source_release(audio_source);
 		return true;
 	}
+
 	if ((flags & OBS_SOURCE_AUDIO) == 0) {
 		*out_ts = start_ts_in;
+		obs_source_release(audio_source);
 		return true;
 	}
 
 	const uint64_t source_ts = obs_source_get_audio_timestamp(audio_source);
 	if (!source_ts) {
 		*out_ts = start_ts_in;
+		obs_source_release(audio_source);
 		return true;
 	}
 
-	if (obs_source_audio_pending(audio_source))
+	if (obs_source_audio_pending(audio_source)) {
+		obs_source_release(audio_source);
 		return false;
+	}
 
 	struct obs_source_audio_mix audio;
 	obs_source_get_audio_mix(audio_source, &audio);
@@ -231,6 +387,7 @@ static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end
 	}
 
 	*out_ts = source_ts;
+	obs_source_release(audio_source);
 
 	return true;
 }
@@ -252,30 +409,41 @@ static const char *GetFormatExt(const char *format)
 	return format;
 }
 
+/* Starts file output on the queued task thread and updates "showing" state. */
 static void start_file_output_task(void *data)
 {
 	struct source_record_filter_context *context = data;
 	if (obs_output_start(context->fileOutput)) {
 		if (!context->output_active) {
 			context->output_active = true;
-			obs_source_inc_showing(obs_filter_get_parent(context->source));
+			obs_source_t *parent = get_parent_source_ref(context);
+			if (parent) {
+				obs_source_inc_showing(parent);
+				obs_source_release(parent);
+			}
 		}
 	}
 	context->starting_file_output = false;
 }
 
+/* Starts stream output on the queued task thread and updates "showing" state. */
 static void start_stream_output_task(void *data)
 {
 	struct source_record_filter_context *context = data;
 	if (obs_output_start(context->streamOutput)) {
 		if (!context->output_active) {
 			context->output_active = true;
-			obs_source_inc_showing(obs_filter_get_parent(context->source));
+			obs_source_t *parent = get_parent_source_ref(context);
+			if (parent) {
+				obs_source_inc_showing(parent);
+				obs_source_release(parent);
+			}
 		}
 	}
 	context->starting_stream_output = false;
 }
 
+/* Releases encoders only when they are idle and no output mode still needs them. */
 static void release_encoders(void *param)
 {
 	struct source_record_filter_context *context = param;
@@ -298,6 +466,7 @@ struct stop_output {
 	obs_output_t *output;
 };
 
+/* Stop-signal callback that releases output + deferred encoder cleanup. */
 void release_output_stopped(void *data, calldata_t *cd)
 {
 	UNUSED_PARAMETER(cd);
@@ -313,6 +482,10 @@ void release_output_stopped(void *data, calldata_t *cd)
 	bfree(data);
 }
 
+/*
+ * Force-stop wrapper that guarantees release work is done after "stop".
+ * Pitfall: stop is async, so release cannot happen immediately in general.
+ */
 static void force_stop_output_task(void *data)
 {
 	struct stop_output *so = data;
@@ -328,18 +501,24 @@ static void force_stop_output_task(void *data)
 	}
 }
 
+/* Starts replay output on the queued task thread and updates "showing" state. */
 static void start_replay_task(void *data)
 {
 	struct source_record_filter_context *context = data;
 	if (obs_output_start(context->replayOutput)) {
 		if (!context->output_active) {
 			context->output_active = true;
-			obs_source_inc_showing(obs_filter_get_parent(context->source));
+			obs_source_t *parent = get_parent_source_ref(context);
+			if (parent) {
+				obs_source_inc_showing(parent);
+				obs_source_release(parent);
+			}
 		}
 	}
 	context->starting_replay_output = false;
 }
 
+/* Creates destination directories for muxer output paths. */
 static void ensure_directory(char *path)
 {
 #ifdef _WIN32
@@ -361,18 +540,67 @@ static void ensure_directory(char *path)
 #endif
 }
 
+struct remove_filter_on_stop {
+	obs_output_t *output;
+	obs_weak_source_t *parent;
+	obs_weak_source_t *filter;
+};
+
+/*
+ * remove_after_record callback.
+ * Uses output-bound callback state + weak refs to avoid mutable context races.
+ */
 static void remove_filter(void *data, calldata_t *calldata)
 {
 	UNUSED_PARAMETER(calldata);
-	struct source_record_filter_context *filter = data;
-	signal_handler_t *sh = obs_output_get_signal_handler(filter->fileOutput);
-	signal_handler_disconnect(sh, "stop", remove_filter, filter);
-	obs_source_t *source = obs_filter_get_parent(filter->source);
-	if (!source && filter->view) {
-		source = obs_view_get_source(filter->view, SOURCE_CHANNEL);
-		obs_source_release(source);
+	struct remove_filter_on_stop *remove_data = data;
+	signal_handler_t *sh = obs_output_get_signal_handler(remove_data->output);
+	if (sh)
+		signal_handler_disconnect(sh, "stop", remove_filter, remove_data);
+
+	obs_source_t *parent = remove_data->parent ? obs_weak_source_get_source(remove_data->parent) : NULL;
+	obs_source_t *filter = remove_data->filter ? obs_weak_source_get_source(remove_data->filter) : NULL;
+	if (!parent && filter)
+		parent = find_filter_parent_ref(filter);
+	if (parent && filter && !obs_source_removed(filter))
+		obs_source_filter_remove(parent, filter);
+
+	if (filter)
+		obs_source_release(filter);
+	if (parent)
+		obs_source_release(parent);
+	if (remove_data->filter)
+		obs_weak_source_release(remove_data->filter);
+	if (remove_data->parent)
+		obs_weak_source_release(remove_data->parent);
+	bfree(remove_data);
+}
+
+/* Connects remove_after_record callback for a newly created output instance. */
+static void connect_remove_filter_callback(struct source_record_filter_context *filter, obs_output_t *output)
+{
+	if (!filter->remove_after_record || !output || !filter->source)
+		return;
+
+	obs_source_t *parent = get_parent_source_ref(filter);
+	struct remove_filter_on_stop *remove_data = bzalloc(sizeof(struct remove_filter_on_stop));
+	remove_data->output = output;
+	if (parent)
+		remove_data->parent = obs_source_get_weak_source(parent);
+	remove_data->filter = obs_source_get_weak_source(filter->source);
+	if (parent)
+		obs_source_release(parent);
+
+	signal_handler_t *sh = obs_output_get_signal_handler(output);
+	if (!sh) {
+		obs_weak_source_release(remove_data->filter);
+		if (remove_data->parent)
+			obs_weak_source_release(remove_data->parent);
+		bfree(remove_data);
+		return;
 	}
-	obs_source_filter_remove(source, filter->source);
+
+	signal_handler_connect(sh, "stop", remove_filter, remove_data);
 }
 
 static const char *get_encoder_id(obs_data_t *settings)
@@ -411,6 +639,7 @@ static void (*obs_encoder_set_gpu_scale_type_func)(obs_encoder_t *encoder, enum 
 
 static bool (*obs_encoder_set_frame_rate_divisor_func)(obs_encoder_t *, uint32_t) = NULL;
 
+/* Applies scaling/divisor settings and binds a video encoder to all active outputs. */
 static void update_video_encoder(struct source_record_filter_context *filter, obs_data_t *settings)
 {
 	if (obs_encoder_video(filter->encoder) != filter->video_output) {
@@ -447,6 +676,7 @@ static void update_video_encoder(struct source_record_filter_context *filter, ob
 		obs_output_set_video_encoder(filter->replayOutput, filter->encoder);
 }
 
+/* Creates or updates recording output and queues async start. */
 static void start_file_output(struct source_record_filter_context *filter, obs_data_t *settings)
 {
 	obs_data_t *s = obs_data_create();
@@ -474,10 +704,7 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 	if (!filter->fileOutput || strcmp(obs_output_get_id(filter->fileOutput), output_id) != 0) {
 		obs_output_release(filter->fileOutput);
 		filter->fileOutput = obs_output_create(output_id, obs_source_get_name(filter->source), s, NULL);
-		if (filter->remove_after_record) {
-			signal_handler_t *sh = obs_output_get_signal_handler(filter->fileOutput);
-			signal_handler_connect(sh, "stop", remove_filter, filter);
-		}
+		connect_remove_filter_callback(filter, filter->fileOutput);
 	} else {
 		obs_output_update(filter->fileOutput, s);
 	}
@@ -502,6 +729,7 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 #define FTL_PROTOCOL "ftl"
 #define RTMP_PROTOCOL "rtmp"
 
+/* Creates or updates streaming service/output and queues async start. */
 static void start_stream_output(struct source_record_filter_context *filter, obs_data_t *settings)
 {
 	if (!filter->service) {
@@ -580,6 +808,7 @@ static void start_stream_output(struct source_record_filter_context *filter, obs
 	run_queued(start_stream_output_task, filter);
 }
 
+/* Creates or updates replay output and queues async start. */
 static void start_replay_output(struct source_record_filter_context *filter, obs_data_t *settings)
 {
 	obs_data_t *s = obs_data_create();
@@ -594,7 +823,7 @@ static void start_replay_output(struct source_record_filter_context *filter, obs
 	if (!filter->replayOutput) {
 		obs_data_t *hotkeys = obs_data_get_obj(settings, "replay_hotkeys");
 		struct dstr name;
-		obs_source_t *parent = obs_filter_get_parent(filter->source);
+		obs_source_t *parent = get_parent_source_ref(filter);
 		if (parent) {
 			dstr_init_copy(&name, obs_source_get_name(parent));
 			dstr_cat(&name, " - ");
@@ -604,12 +833,11 @@ static void start_replay_output(struct source_record_filter_context *filter, obs
 		}
 
 		filter->replayOutput = obs_output_create("replay_buffer", name.array, s, hotkeys);
-		if (filter->remove_after_record) {
-			signal_handler_t *sh = obs_output_get_signal_handler(filter->replayOutput);
-			signal_handler_connect(sh, "stop", remove_filter, filter);
-		}
+		connect_remove_filter_callback(filter, filter->replayOutput);
 		dstr_free(&name);
 		obs_data_release(hotkeys);
+		if (parent)
+			obs_source_release(parent);
 	} else {
 		obs_output_update(filter->replayOutput, s);
 	}
@@ -631,6 +859,7 @@ static void start_replay_output(struct source_record_filter_context *filter, obs
 	run_queued(start_replay_task, filter);
 }
 
+/* Copies default values from one obs_data object to another by item type. */
 static void copy_defaults(obs_data_t *from, obs_data_t *to)
 {
 	for (obs_data_item_t *default_item = obs_data_first(from); default_item != NULL; obs_data_item_next(&default_item)) {
@@ -653,6 +882,7 @@ static void copy_defaults(obs_data_t *from, obs_data_t *to)
 	}
 }
 
+/* Loads encoder defaults for selected video/audio encoders into settings. */
 static void set_encoder_defaults(obs_data_t *settings)
 {
 	obs_data_t *enc_defaults = obs_encoder_defaults(get_encoder_id(settings));
@@ -674,6 +904,10 @@ static void set_encoder_defaults(obs_data_t *settings)
 	}
 }
 
+/*
+ * Rebuilds/updates encoders and audio output topology when settings change.
+ * Pitfall: audio output ownership depends on selected track mode.
+ */
 static void update_encoder(struct source_record_filter_context *filter, obs_data_t *settings)
 {
 	const char *enc_id = get_encoder_id(settings);
@@ -790,12 +1024,17 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 	filter->audio_track = audio_track;
 }
 
+/*
+ * Core state reconciler for the filter.
+ * Test focus: mode transitions, restart paths, and async stop/start ordering.
+ */
 static void source_record_filter_update(void *data, obs_data_t *settings)
 {
 	struct source_record_filter_context *filter = data;
-	obs_source_t *parent = obs_filter_get_parent(filter->source);
-	if (obs_obj_is_private(parent)) {
+	obs_source_t *parent = get_parent_source_ref(filter);
+	if (parent && obs_obj_is_private(parent)) {
 		filter->closing = true;
+		obs_source_release(parent);
 		return;
 	}
 	if (obs_data_get_bool(settings, "scale")) {
@@ -841,29 +1080,27 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 	}
 
 	if (parent && filter->view && (record || replay_buffer)) {
-		obs_source_t *view_source = obs_view_get_source(filter->view, SOURCE_CHANNEL);
-		if (view_source != parent)
-			obs_view_set_source(filter->view, SOURCE_CHANNEL, parent);
-		obs_source_release(view_source);
+		obs_view_set_source(filter->view, SOURCE_CHANNEL, parent);
 	}
 
 	if (parent && filter->view && !filter->closing) {
-		obs_source_t *background_source = obs_view_get_source(filter->view, BACKGROUND_CHANNEL);
-		if (!background_source) {
-			background_source = obs_source_create_private("color_source", "Source Record Background", NULL);
-			obs_view_set_source(filter->view, BACKGROUND_CHANNEL, background_source);
+		if (!filter->background_source) {
+			filter->background_source = obs_source_create_private("color_source", "Source Record Background", NULL);
+			if (filter->background_source)
+				obs_view_set_source(filter->view, BACKGROUND_CHANNEL, filter->background_source);
 		}
-		obs_data_t *css = obs_source_get_settings(background_source);
-		if (obs_data_get_int(css, "color") != obs_data_get_int(settings, "backgroundColor") ||
-		    obs_data_get_int(css, "width") != obs_source_get_width(parent) ||
-		    obs_data_get_int(css, "height") != obs_source_get_height(parent)) {
-			obs_data_set_int(css, "color", obs_data_get_int(settings, "backgroundColor"));
-			obs_data_set_int(css, "width", obs_source_get_width(parent));
-			obs_data_set_int(css, "height", obs_source_get_height(parent));
-			obs_source_update(background_source, css);
+		if (filter->background_source) {
+			obs_data_t *css = obs_source_get_settings(filter->background_source);
+			if (obs_data_get_int(css, "color") != obs_data_get_int(settings, "backgroundColor") ||
+			    obs_data_get_int(css, "width") != obs_source_get_width(parent) ||
+			    obs_data_get_int(css, "height") != obs_source_get_height(parent)) {
+				obs_data_set_int(css, "color", obs_data_get_int(settings, "backgroundColor"));
+				obs_data_set_int(css, "width", obs_source_get_width(parent));
+				obs_data_set_int(css, "height", obs_source_get_height(parent));
+				obs_source_update(filter->background_source, css);
+			}
+			obs_data_release(css);
 		}
-		obs_data_release(css);
-		obs_source_release(background_source);
 	}
 
 	if (record != filter->record) {
@@ -945,10 +1182,7 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 	}
 
 	if (parent && filter->view && stream) {
-		obs_source_t *view_source = obs_view_get_source(filter->view, SOURCE_CHANNEL);
-		if (view_source != parent)
-			obs_view_set_source(filter->view, SOURCE_CHANNEL, parent);
-		obs_source_release(view_source);
+		obs_view_set_source(filter->view, SOURCE_CHANNEL, parent);
 	}
 
 	if (stream != filter->stream) {
@@ -990,28 +1224,34 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 				filter->audio_source = NULL;
 			}
 		} else {
-			obs_source_t *source = obs_weak_source_get_source(filter->audio_source);
-			if (source)
-				obs_source_release(source);
+			obs_source_t *source = filter->audio_source ? obs_weak_source_get_source(filter->audio_source) : NULL;
 			if (!source || strcmp(source_name, obs_source_get_name(source)) != 0) {
 				if (filter->audio_source) {
 					obs_weak_source_release(filter->audio_source);
 					filter->audio_source = NULL;
 				}
+				if (source)
+					obs_source_release(source);
 				source = obs_get_source_by_name(source_name);
 				if (source) {
 					filter->audio_source = obs_source_get_weak_source(source);
 					obs_source_release(source);
+					source = NULL;
 				}
 			}
+			if (source)
+				obs_source_release(source);
 		}
 
 	} else if (filter->audio_source) {
 		obs_weak_source_release(filter->audio_source);
 		filter->audio_source = NULL;
 	}
+	if (parent)
+		obs_source_release(parent);
 }
 
+/* Persists replay output hotkeys into filter settings when saving profile data. */
 static void source_record_filter_save(void *data, obs_data_t *settings)
 {
 	struct source_record_filter_context *filter = data;
@@ -1022,6 +1262,7 @@ static void source_record_filter_save(void *data, obs_data_t *settings)
 	}
 }
 
+/* Initializes defaults from the active OBS profile output configuration. */
 static void source_record_filter_defaults(obs_data_t *settings)
 {
 	config_t *config = obs_frontend_get_profile_config();
@@ -1073,12 +1314,14 @@ static void source_record_filter_defaults(obs_data_t *settings)
 
 static void source_record_filter_filter_remove(void *data, obs_source_t *parent);
 
+/* Queued helper used to avoid updating source state directly in event callback threads. */
 static void update_task(void *param)
 {
 	struct source_record_filter_context *context = param;
 	obs_source_update(context->source, NULL);
 }
 
+/* Frontend event callback that schedules/forces updates on relevant OBS state changes. */
 static void frontend_event(enum obs_frontend_event event, void *data)
 {
 	struct source_record_filter_context *context = data;
@@ -1101,6 +1344,7 @@ static void frontend_event(enum obs_frontend_event event, void *data)
 	}
 }
 
+/* OBS create callback: allocates context, applies initial update, and registers events. */
 static void *source_record_filter_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct source_record_filter_context *context = bzalloc(sizeof(struct source_record_filter_context));
@@ -1117,6 +1361,10 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 	return context;
 }
 
+/*
+ * Finalizer that waits until encoders are no longer active.
+ * Pitfall: direct free during active encoding can crash OBS.
+ */
 static void source_record_delayed_destroy(void *data)
 {
 	struct source_record_filter_context *context = data;
@@ -1140,6 +1388,10 @@ static void source_record_delayed_destroy(void *data)
 
 	obs_weak_source_release(context->audio_source);
 	context->audio_source = NULL;
+	obs_weak_source_release(context->parent_source);
+	context->parent_source = NULL;
+	obs_source_release(context->background_source);
+	context->background_source = NULL;
 
 	if (context->audio_track == 0)
 		audio_output_close(context->audio_output);
@@ -1149,7 +1401,7 @@ static void source_record_delayed_destroy(void *data)
 	if (context->video_output && context->view) {
 		obs_view_set_source(context->view, BACKGROUND_CHANNEL, NULL);
 		obs_view_set_source(context->view, SOURCE_CHANNEL, NULL);
-		obs_view_remove(context->view);
+		source_record_view_remove(context->view);
 		context->video_output = NULL;
 	}
 
@@ -1158,15 +1410,18 @@ static void source_record_delayed_destroy(void *data)
 	bfree(context);
 }
 
+/* OBS destroy callback: initiates async stop/unregister then defers final free. */
 static void source_record_filter_destroy(void *data)
 {
 	struct source_record_filter_context *context = data;
 	da_erase_item(source_record_filters, &context->source);
 	context->closing = true;
 	if (context->output_active) {
-		obs_source_t *parent = obs_filter_get_parent(context->source);
-		if (parent)
+		obs_source_t *parent = get_parent_source_ref(context);
+		if (parent) {
 			obs_source_dec_showing(parent);
+			obs_source_release(parent);
+		}
 		context->output_active = false;
 	}
 	obs_frontend_remove_event_callback(frontend_event, context);
@@ -1209,6 +1464,7 @@ static void source_record_filter_destroy(void *data)
 	source_record_delayed_destroy(context);
 }
 
+/* Hotkey callback: enables the filter source. */
 static bool source_record_enable_hotkey(void *data, obs_hotkey_pair_id id, obs_hotkey_t *hotkey, bool pressed)
 {
 	UNUSED_PARAMETER(id);
@@ -1224,6 +1480,7 @@ static bool source_record_enable_hotkey(void *data, obs_hotkey_pair_id id, obs_h
 	return true;
 }
 
+/* Hotkey callback: disables the filter source. */
 static bool source_record_disable_hotkey(void *data, obs_hotkey_pair_id id, obs_hotkey_t *hotkey, bool pressed)
 {
 	UNUSED_PARAMETER(id);
@@ -1237,6 +1494,7 @@ static bool source_record_disable_hotkey(void *data, obs_hotkey_pair_id id, obs_
 	return true;
 }
 
+/* Hotkey callback: pauses active file recording output. */
 static bool source_record_pause_hotkey(void *data, obs_hotkey_pair_id id, obs_hotkey_t *hotkey, bool pressed)
 {
 	UNUSED_PARAMETER(id);
@@ -1245,13 +1503,14 @@ static bool source_record_pause_hotkey(void *data, obs_hotkey_pair_id id, obs_ho
 	if (!pressed)
 		return false;
 
-	if (obs_output_paused(context->fileOutput))
+	if (!context->fileOutput || obs_output_paused(context->fileOutput))
 		return false;
 
 	obs_output_pause(context->fileOutput, true);
 	return true;
 }
 
+/* Hotkey callback: unpauses active file recording output. */
 static bool source_record_unpause_hotkey(void *data, obs_hotkey_pair_id id, obs_hotkey_t *hotkey, bool pressed)
 {
 	UNUSED_PARAMETER(id);
@@ -1259,13 +1518,14 @@ static bool source_record_unpause_hotkey(void *data, obs_hotkey_pair_id id, obs_
 	struct source_record_filter_context *context = data;
 	if (!pressed)
 		return false;
-	if (!obs_output_paused(context->fileOutput))
+	if (!context->fileOutput || !obs_output_paused(context->fileOutput))
 		return false;
 
 	obs_output_pause(context->fileOutput, false);
 	return true;
 }
 
+/* Hotkey callback: forwards split-file request to file output proc handler. */
 static void source_record_split_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
 {
 	UNUSED_PARAMETER(id);
@@ -1282,6 +1542,7 @@ static void source_record_split_hotkey(void *data, obs_hotkey_id id, obs_hotkey_
 	calldata_free(&cd);
 }
 
+/* Hotkey callback: forwards chapter request to file output proc handler. */
 static void source_record_chapter_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
 {
 	UNUSED_PARAMETER(id);
@@ -1298,6 +1559,12 @@ static void source_record_chapter_hotkey(void *data, obs_hotkey_id id, obs_hotke
 	calldata_free(&cd);
 }
 
+/*
+ * Per-frame maintenance:
+ * - keeps view/background in sync with parent dimensions
+ * - handles restart and disabled transitions
+ * - enforces optional max recording duration
+ */
 static void source_record_filter_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
@@ -1305,12 +1572,13 @@ static void source_record_filter_tick(void *data, float seconds)
 	if (context->closing)
 		return;
 
-	obs_source_t *parent = obs_filter_get_parent(context->source);
+	obs_source_t *parent = get_parent_source_ref(context);
 	if (!parent)
 		return;
 
 	if (obs_obj_is_private(parent)) {
 		context->closing = true;
+		obs_source_release(parent);
 		return;
 	}
 
@@ -1322,18 +1590,18 @@ static void source_record_filter_tick(void *data, float seconds)
 
 	if (context->pauseHotkeys == OBS_INVALID_HOTKEY_PAIR_ID)
 		context->pauseHotkeys = obs_hotkey_pair_register_source(
-			parent, "source_record.PauseRecording", obs_frontend_get_locale_string("Basic.Main.PauseRecording"),
-			"source_record.UnpauseRecording", obs_frontend_get_locale_string("Basic.Main.UnpauseRecording"),
+			parent, "source_record.PauseRecording", source_record_get_locale_string("Basic.Main.PauseRecording"),
+			"source_record.UnpauseRecording", source_record_get_locale_string("Basic.Main.UnpauseRecording"),
 			source_record_pause_hotkey, source_record_unpause_hotkey, context, context);
 
 	if (context->splitHotkey == OBS_INVALID_HOTKEY_ID)
 		context->splitHotkey = obs_hotkey_register_source(parent, "source_record.SplitRecording",
-								  obs_frontend_get_locale_string("Basic.Main.SplitFile"),
+								  source_record_get_locale_string("Basic.Main.SplitFile"),
 								  source_record_split_hotkey, context);
 
 	if (context->chapterHotkey == OBS_INVALID_HOTKEY_ID)
 		context->chapterHotkey = obs_hotkey_register_source(parent, "source_record.AddChapterMarker",
-								    obs_frontend_get_locale_string("Basic.Main.AddChapterMarker"),
+								    source_record_get_locale_string("Basic.Main.AddChapterMarker"),
 								    source_record_chapter_hotkey, context);
 
 	uint32_t width = obs_source_get_width(parent);
@@ -1354,9 +1622,9 @@ static void source_record_filter_tick(void *data, float seconds)
 
 		const bool restart = !!context->video_output;
 		if (restart)
-			obs_view_remove(context->view);
+			source_record_view_remove(context->view);
 
-		context->video_output = obs_view_add2(context->view, &ovi);
+		context->video_output = source_record_view_add(context->view, &ovi);
 		if (context->video_output) {
 			context->width = width;
 			context->height = height;
@@ -1389,37 +1657,37 @@ static void source_record_filter_tick(void *data, float seconds)
 		}
 		context->output_active = false;
 		context->restart = false;
-		obs_source_dec_showing(obs_filter_get_parent(context->source));
+		obs_source_dec_showing(parent);
 	} else if (!context->output_active && obs_source_enabled(context->source) &&
 		   (context->replayBuffer || context->record || context->stream)) {
 		if (context->starting_file_output || context->starting_stream_output || context->starting_replay_output ||
-		    !context->video_output || !width || !height)
+		    !context->video_output || !width || !height) {
+			obs_source_release(parent);
 			return;
+		}
 		obs_data_t *s = obs_source_get_settings(context->source);
 		update_encoder(context, s);
 		if (context->record || context->stream || context->replayBuffer) {
-			obs_source_t *view_source = obs_view_get_source(context->view, SOURCE_CHANNEL);
-			if (view_source != parent)
-				obs_view_set_source(context->view, SOURCE_CHANNEL, parent);
-			obs_source_release(view_source);
+			obs_view_set_source(context->view, SOURCE_CHANNEL, parent);
 		}
 
-		obs_source_t *background_source = obs_view_get_source(context->view, BACKGROUND_CHANNEL);
-		if (!background_source) {
-			background_source = obs_source_create_private("color_source", "Source Record Background", NULL);
-			obs_view_set_source(context->view, BACKGROUND_CHANNEL, background_source);
+		if (!context->background_source) {
+			context->background_source = obs_source_create_private("color_source", "Source Record Background", NULL);
+			if (context->background_source)
+				obs_view_set_source(context->view, BACKGROUND_CHANNEL, context->background_source);
 		}
-		obs_data_t *css = obs_source_get_settings(background_source);
-		if (obs_data_get_int(css, "color") != obs_data_get_int(s, "backgroundColor") ||
-		    obs_data_get_int(css, "width") != obs_source_get_width(parent) ||
-		    obs_data_get_int(css, "height") != obs_source_get_height(parent)) {
-			obs_data_set_int(css, "color", obs_data_get_int(s, "backgroundColor"));
-			obs_data_set_int(css, "width", obs_source_get_width(parent));
-			obs_data_set_int(css, "height", obs_source_get_height(parent));
-			obs_source_update(background_source, css);
+		if (context->background_source) {
+			obs_data_t *css = obs_source_get_settings(context->background_source);
+			if (obs_data_get_int(css, "color") != obs_data_get_int(s, "backgroundColor") ||
+			    obs_data_get_int(css, "width") != obs_source_get_width(parent) ||
+			    obs_data_get_int(css, "height") != obs_source_get_height(parent)) {
+				obs_data_set_int(css, "color", obs_data_get_int(s, "backgroundColor"));
+				obs_data_set_int(css, "width", obs_source_get_width(parent));
+				obs_data_set_int(css, "height", obs_source_get_height(parent));
+				obs_source_update(context->background_source, css);
+			}
+			obs_data_release(css);
 		}
-		obs_data_release(css);
-		obs_source_release(background_source);
 
 		if (context->record)
 			start_file_output(context, s);
@@ -1451,7 +1719,7 @@ static void source_record_filter_tick(void *data, float seconds)
 			context->replayOutput = NULL;
 		}
 		context->output_active = false;
-		obs_source_dec_showing(obs_filter_get_parent(context->source));
+		obs_source_dec_showing(parent);
 	}
 
 	if (context->output_active && context->fileOutput && context->record_max_seconds) {
@@ -1466,8 +1734,10 @@ static void source_record_filter_tick(void *data, float seconds)
 			obs_data_release(settings);
 		}
 	}
+	obs_source_release(parent);
 }
 
+/* Recursively triggers property modified callbacks for nested property groups. */
 static void all_properties_changed(obs_properties_t *props, obs_data_t *settings)
 {
 	obs_property_t *property = obs_properties_first(props);
@@ -1481,6 +1751,7 @@ static void all_properties_changed(obs_properties_t *props, obs_data_t *settings
 	}
 }
 
+/* Rebuilds dynamic encoder property groups when selected encoders change. */
 static bool encoder_changed(void *data, obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
 {
 	UNUSED_PARAMETER(data);
@@ -1528,6 +1799,7 @@ static bool encoder_changed(void *data, obs_properties_t *props, obs_property_t 
 	return true;
 }
 
+/* Property enumeration callback listing valid audio/composite sources. */
 static bool list_add_audio_sources(void *data, obs_source_t *source)
 {
 	obs_property_t *p = data;
@@ -1540,6 +1812,7 @@ static bool list_add_audio_sources(void *data, obs_source_t *source)
 	return true;
 }
 
+/* Properties button callback to split active file output immediately. */
 static bool source_record_split_button(obs_properties_t *props, obs_property_t *property, void *data)
 {
 	UNUSED_PARAMETER(props);
@@ -1555,6 +1828,7 @@ static bool source_record_split_button(obs_properties_t *props, obs_property_t *
 	return true;
 }
 
+/* Returns true when an output type id exists in current OBS build. */
 bool output_exists(const char *id)
 {
 	const char *output_id;
@@ -1566,6 +1840,10 @@ bool output_exists(const char *id)
 	return false;
 }
 
+/*
+ * Builds full properties UI.
+ * Test focus: dynamic encoder groups, defaults, and visibility toggles.
+ */
 static obs_properties_t *source_record_filter_properties(void *data)
 {
 	obs_properties_t *props = obs_properties_create();
@@ -1601,14 +1879,14 @@ static obs_properties_t *source_record_filter_properties(void *data)
 
 	obs_properties_t *split_file = obs_properties_create();
 	p = obs_properties_add_int(split_file, "max_time_sec",
-				   obs_frontend_get_locale_string("Basic.Settings.Output.SplitFile.Time"), 0, 31536000, 1);
+				   source_record_get_locale_string("Basic.Settings.Output.SplitFile.Time"), 0, 31536000, 1);
 	obs_property_int_set_suffix(p, " s");
 	p = obs_properties_add_int(split_file, "max_size_mb",
-				   obs_frontend_get_locale_string("Basic.Settings.Output.SplitFile.Size"), 0, 1073741824, 1);
+				   source_record_get_locale_string("Basic.Settings.Output.SplitFile.Size"), 0, 1073741824, 1);
 	obs_property_int_set_suffix(p, " MB");
-	obs_properties_add_button(split_file, "split_file_now", obs_frontend_get_locale_string("Basic.Main.SplitFile"),
+	obs_properties_add_button(split_file, "split_file_now", source_record_get_locale_string("Basic.Main.SplitFile"),
 				  source_record_split_button);
-	obs_properties_add_group(record, "split_file", obs_frontend_get_locale_string("Basic.Settings.Output.EnableSplitFile"),
+	obs_properties_add_group(record, "split_file", source_record_get_locale_string("Basic.Settings.Output.EnableSplitFile"),
 				 OBS_GROUP_CHECKABLE, split_file);
 
 	obs_properties_add_int(record, "record_max_seconds", obs_module_text("MaxSeconds"), 0, 100000, 1);
@@ -1679,13 +1957,13 @@ static obs_properties_t *source_record_filter_properties(void *data)
 	if (obs_encoder_set_gpu_scale_type_func) {
 		p = obs_properties_add_list(scale, "scale_type", obs_module_text("ScaleType"), OBS_COMBO_TYPE_LIST,
 					    OBS_COMBO_FORMAT_INT);
-		obs_property_list_add_int(p, obs_frontend_get_locale_string("Basic.Settings.Video.DownscaleFilter.Bilinear"),
+		obs_property_list_add_int(p, source_record_get_locale_string("Basic.Settings.Video.DownscaleFilter.Bilinear"),
 					  OBS_SCALE_BILINEAR);
-		obs_property_list_add_int(p, obs_frontend_get_locale_string("Basic.Settings.Video.DownscaleFilter.Area"),
+		obs_property_list_add_int(p, source_record_get_locale_string("Basic.Settings.Video.DownscaleFilter.Area"),
 					  OBS_SCALE_AREA);
-		obs_property_list_add_int(p, obs_frontend_get_locale_string("Basic.Settings.Video.DownscaleFilter.Bicubic"),
+		obs_property_list_add_int(p, source_record_get_locale_string("Basic.Settings.Video.DownscaleFilter.Bicubic"),
 					  OBS_SCALE_BICUBIC);
-		obs_property_list_add_int(p, obs_frontend_get_locale_string("Basic.Settings.Video.DownscaleFilter.Lanczos"),
+		obs_property_list_add_int(p, source_record_get_locale_string("Basic.Settings.Video.DownscaleFilter.Lanczos"),
 					  OBS_SCALE_LANCZOS);
 	}
 
@@ -1766,10 +2044,11 @@ static obs_properties_t *source_record_filter_properties(void *data)
 				continue;
 			if (sources_text.len)
 				dstr_cat(&sources_text, "\n");
-			obs_source_t *parent = obs_filter_get_parent(source_record_filters.array[i]);
+			obs_source_t *parent = find_filter_parent_ref(source_record_filters.array[i]);
 			if (parent) {
 				dstr_cat(&sources_text, obs_source_get_name(parent));
 				dstr_cat(&sources_text, " - ");
+				obs_source_release(parent);
 			}
 			dstr_cat(&sources_text, obs_source_get_name(source_record_filters.array[i]));
 		}
@@ -1794,17 +2073,23 @@ static obs_properties_t *source_record_filter_properties(void *data)
 	return props;
 }
 
+/* Render callback: refreshes cached parent weak ref from OBS-safe context. */
 static void source_record_filter_render(void *data, gs_effect_t *effect)
 {
 	UNUSED_PARAMETER(effect);
 	struct source_record_filter_context *context = data;
+	obs_source_t *parent = obs_filter_get_parent(context->source);
+	if (parent)
+		update_parent_weak_ref(context, parent);
 	obs_source_skip_video_filter(context->source);
 }
 
+/* filter_remove callback: stop outputs and detach view channels promptly. */
 static void source_record_filter_filter_remove(void *data, obs_source_t *parent)
 {
 	UNUSED_PARAMETER(parent);
 	struct source_record_filter_context *context = data;
+	update_parent_weak_ref(context, NULL);
 	context->closing = true;
 	if (context->fileOutput) {
 		struct stop_output *so = bmalloc(sizeof(struct stop_output));
@@ -1860,6 +2145,7 @@ MODULE_EXPORT const char *obs_module_description(void)
 
 static void *vendor;
 
+/* Finds the first source-record filter attached to a source. */
 static void find_filter(obs_source_t *parent, obs_source_t *child, void *param)
 {
 	UNUSED_PARAMETER(parent);
@@ -1870,21 +2156,40 @@ static void find_filter(obs_source_t *parent, obs_source_t *child, void *param)
 	*filter = child;
 }
 
+/*
+ * Collects parent sources that contain a source-record filter.
+ * Stores strong refs because iteration happens after enumeration returns.
+ */
 static void find_source_by_filter(obs_source_t *parent, obs_source_t *child, void *param)
 {
 	if (strcmp(obs_source_get_unversioned_id(child), "source_record_filter") != 0)
 		return;
 
 	DARRAY(obs_source_t *) *sources = param;
-	darray_push_back(sizeof(obs_source_t *), &sources->da, &parent);
+	obs_source_t *parent_ref = obs_source_get_ref(parent);
+	if (parent_ref)
+		darray_push_back(sizeof(obs_source_t *), &sources->da, &parent_ref);
 }
 
+/* Source enumeration callback used for websocket "all sources" operations. */
 static bool find_source(void *data, obs_source_t *source)
 {
 	obs_source_enum_filters(source, find_source_by_filter, data);
 	return true;
 }
 
+/* Releases the strong refs retained by bulk websocket source enumeration. */
+static void release_source_array(struct darray *sources_da, obs_source_t **sources_array, size_t sources_num)
+{
+	for (size_t i = 0; i < sources_num; i++)
+		obs_source_release(sources_array[i]);
+	darray_free(sources_da);
+}
+
+/*
+ * Resolves a source-record filter for a source.
+ * If create=true and none exists, it creates one (auto-remove enabled for ws usage).
+ */
 obs_source_t *get_source_record_filter(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data, bool create)
 {
 	const char *filter_name = obs_data_get_string(request_data, "filter");
@@ -1955,6 +2260,7 @@ obs_source_t *get_source_record_filter(obs_source_t *source, obs_data_t *request
 	return filter;
 }
 
+/* Starts per-source recording mode, optionally forcing restart on filename changes. */
 static bool start_record_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
 {
 	obs_source_t *filter = get_source_record_filter(source, request_data, response_data, true);
@@ -1986,6 +2292,7 @@ static bool start_record_source(obs_source_t *source, obs_data_t *request_data, 
 	return true;
 }
 
+/* Pauses per-source recording if a file output is currently active. */
 static bool pause_record_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
 {
 	obs_source_t *filter = get_source_record_filter(source, request_data, response_data, false);
@@ -1993,13 +2300,16 @@ static bool pause_record_source(obs_source_t *source, obs_data_t *request_data, 
 		return false;
 
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	obs_source_release(filter);
-	if (!context->fileOutput)
+	if (!context || !context->fileOutput) {
+		obs_source_release(filter);
 		return false;
+	}
 	obs_output_pause(context->fileOutput, true);
+	obs_source_release(filter);
 	return true;
 }
 
+/* Unpauses per-source recording if a file output is currently active. */
 static bool unpause_record_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
 {
 	obs_source_t *filter = get_source_record_filter(source, request_data, response_data, false);
@@ -2007,13 +2317,16 @@ static bool unpause_record_source(obs_source_t *source, obs_data_t *request_data
 		return false;
 
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	obs_source_release(filter);
-	if (!context->fileOutput)
+	if (!context || !context->fileOutput) {
+		obs_source_release(filter);
 		return false;
+	}
 	obs_output_pause(context->fileOutput, false);
+	obs_source_release(filter);
 	return true;
 }
 
+/* Requests split-file on active per-source recording output. */
 static bool split_record_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
 {
 	obs_source_t *filter = get_source_record_filter(source, request_data, response_data, false);
@@ -2021,20 +2334,23 @@ static bool split_record_source(obs_source_t *source, obs_data_t *request_data, 
 		return false;
 
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	obs_source_release(filter);
-	if (!context->fileOutput)
+	if (!context || !context->fileOutput) {
+		obs_source_release(filter);
 		return false;
+	}
 	proc_handler_t *ph = obs_output_get_proc_handler(context->fileOutput);
 	struct calldata cd;
 	calldata_init(&cd);
+	bool success = true;
 	if (!proc_handler_call(ph, "split_file", &cd)) {
-		calldata_free(&cd);
-		return false;
+		success = false;
 	}
 	calldata_free(&cd);
-	return true;
+	obs_source_release(filter);
+	return success;
 }
 
+/* Requests chapter marker insertion on active per-source recording output. */
 static bool add_chapter_record_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
 {
 	obs_source_t *filter = get_source_record_filter(source, request_data, response_data, false);
@@ -2042,21 +2358,24 @@ static bool add_chapter_record_source(obs_source_t *source, obs_data_t *request_
 		return false;
 
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	obs_source_release(filter);
-	if (!context->fileOutput)
+	if (!context || !context->fileOutput) {
+		obs_source_release(filter);
 		return false;
+	}
 	proc_handler_t *ph = obs_output_get_proc_handler(context->fileOutput);
 	struct calldata cd;
 	calldata_init(&cd);
 	calldata_set_string(&cd, "chapter_name", obs_data_get_string(request_data, "chapter_name"));
+	bool success = true;
 	if (!proc_handler_call(ph, "add_chapter", &cd)) {
-		calldata_free(&cd);
-		return false;
+		success = false;
 	}
 	calldata_free(&cd);
-	return true;
+	obs_source_release(filter);
+	return success;
 }
 
+/* Stops per-source recording mode by setting record_mode to none. */
 static bool stop_record_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
 {
 	obs_source_t *filter = get_source_record_filter(source, request_data, response_data, false);
@@ -2071,6 +2390,7 @@ static bool stop_record_source(obs_source_t *source, obs_data_t *request_data, o
 	return true;
 }
 
+/* Vendor request: start recording for one source or all sources with this filter. */
 static void websocket_start_record(obs_data_t *request_data, obs_data_t *response_data, void *param)
 {
 	UNUSED_PARAMETER(param);
@@ -2094,16 +2414,18 @@ static void websocket_start_record(obs_data_t *request_data, obs_data_t *respons
 		if (!sources.num) {
 			obs_data_set_string(response_data, "error", "no source found");
 			obs_data_set_bool(response_data, "success", false);
+			release_source_array(&sources.da, sources.array, sources.num);
 			return;
 		}
 		for (size_t i = 0; i < sources.num; i++) {
 			success = start_record_source(sources.array[i], request_data, response_data) && success;
 		}
-		da_free(sources);
+		release_source_array(&sources.da, sources.array, sources.num);
 	}
 	obs_data_set_bool(response_data, "success", success);
 }
 
+/* Vendor request: pause recording for one source or all matching sources. */
 static void websocket_pause_record(obs_data_t *request_data, obs_data_t *response_data, void *param)
 {
 	UNUSED_PARAMETER(param);
@@ -2125,16 +2447,18 @@ static void websocket_pause_record(obs_data_t *request_data, obs_data_t *respons
 		if (!sources.num) {
 			obs_data_set_string(response_data, "error", "no source found");
 			obs_data_set_bool(response_data, "success", false);
+			release_source_array(&sources.da, sources.array, sources.num);
 			return;
 		}
 		for (size_t i = 0; i < sources.num; i++) {
 			success = pause_record_source(sources.array[i], request_data, response_data) && success;
 		}
-		da_free(sources);
+		release_source_array(&sources.da, sources.array, sources.num);
 	}
 	obs_data_set_bool(response_data, "success", success);
 }
 
+/* Vendor request: unpause recording for one source or all matching sources. */
 static void websocket_unpause_record(obs_data_t *request_data, obs_data_t *response_data, void *param)
 {
 	UNUSED_PARAMETER(param);
@@ -2156,16 +2480,18 @@ static void websocket_unpause_record(obs_data_t *request_data, obs_data_t *respo
 		if (!sources.num) {
 			obs_data_set_string(response_data, "error", "no source found");
 			obs_data_set_bool(response_data, "success", false);
+			release_source_array(&sources.da, sources.array, sources.num);
 			return;
 		}
 		for (size_t i = 0; i < sources.num; i++) {
 			success = unpause_record_source(sources.array[i], request_data, response_data) && success;
 		}
-		da_free(sources);
+		release_source_array(&sources.da, sources.array, sources.num);
 	}
 	obs_data_set_bool(response_data, "success", success);
 }
 
+/* Vendor request: split recording file for one source or all matching sources. */
 static void websocket_split_record(obs_data_t *request_data, obs_data_t *response_data, void *param)
 {
 	UNUSED_PARAMETER(param);
@@ -2187,16 +2513,18 @@ static void websocket_split_record(obs_data_t *request_data, obs_data_t *respons
 		if (!sources.num) {
 			obs_data_set_string(response_data, "error", "no source found");
 			obs_data_set_bool(response_data, "success", false);
+			release_source_array(&sources.da, sources.array, sources.num);
 			return;
 		}
 		for (size_t i = 0; i < sources.num; i++) {
 			success = split_record_source(sources.array[i], request_data, response_data) && success;
 		}
-		da_free(sources);
+		release_source_array(&sources.da, sources.array, sources.num);
 	}
 	obs_data_set_bool(response_data, "success", success);
 }
 
+/* Vendor request: add chapter marker for one source or all matching sources. */
 static void websocket_add_chapter_record(obs_data_t *request_data, obs_data_t *response_data, void *param)
 {
 	UNUSED_PARAMETER(param);
@@ -2218,16 +2546,18 @@ static void websocket_add_chapter_record(obs_data_t *request_data, obs_data_t *r
 		if (!sources.num) {
 			obs_data_set_string(response_data, "error", "no source found");
 			obs_data_set_bool(response_data, "success", false);
+			release_source_array(&sources.da, sources.array, sources.num);
 			return;
 		}
 		for (size_t i = 0; i < sources.num; i++) {
 			success = add_chapter_record_source(sources.array[i], request_data, response_data) && success;
 		}
-		da_free(sources);
+		release_source_array(&sources.da, sources.array, sources.num);
 	}
 	obs_data_set_bool(response_data, "success", success);
 }
 
+/* Vendor request: stop recording for one source or all matching sources. */
 static void websocket_stop_record(obs_data_t *request_data, obs_data_t *response_data, void *param)
 {
 	UNUSED_PARAMETER(param);
@@ -2249,16 +2579,18 @@ static void websocket_stop_record(obs_data_t *request_data, obs_data_t *response
 		if (!sources.num) {
 			obs_data_set_string(response_data, "error", "no source found");
 			obs_data_set_bool(response_data, "success", false);
+			release_source_array(&sources.da, sources.array, sources.num);
 			return;
 		}
 		for (size_t i = 0; i < sources.num; i++) {
 			success = stop_record_source(sources.array[i], request_data, response_data) && success;
 		}
-		da_free(sources);
+		release_source_array(&sources.da, sources.array, sources.num);
 	}
 	obs_data_set_bool(response_data, "success", success);
 }
 
+/* Enables replay buffer mode on a source-record filter. */
 static bool start_replay_buffer_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
 {
 	obs_source_t *filter = get_source_record_filter(source, request_data, response_data, true);
@@ -2289,6 +2621,7 @@ static bool start_replay_buffer_source(obs_source_t *source, obs_data_t *request
 	return true;
 }
 
+/* Disables replay buffer mode on a source-record filter. */
 static bool stop_replay_buffer_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
 {
 	obs_source_t *filter = get_source_record_filter(source, request_data, response_data, false);
@@ -2303,14 +2636,17 @@ static bool stop_replay_buffer_source(obs_source_t *source, obs_data_t *request_
 	return true;
 }
 
+/* Requests immediate replay-buffer save for an active replay output. */
 static bool save_replay_buffer_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
 {
 	obs_source_t *filter = get_source_record_filter(source, request_data, response_data, false);
 	if (!filter)
 		return false;
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	if (!context->replayOutput)
+	if (!context || !context->replayOutput) {
+		obs_source_release(filter);
 		return false;
+	}
 
 	proc_handler_t *ph = obs_output_get_proc_handler(context->replayOutput);
 	calldata_t cd = {0};
@@ -2320,6 +2656,7 @@ static bool save_replay_buffer_source(obs_source_t *source, obs_data_t *request_
 	return success;
 }
 
+/* Vendor request: start replay buffer for one source or all matching sources. */
 static void websocket_start_replay_buffer(obs_data_t *request_data, obs_data_t *response_data, void *param)
 {
 	UNUSED_PARAMETER(param);
@@ -2343,16 +2680,18 @@ static void websocket_start_replay_buffer(obs_data_t *request_data, obs_data_t *
 		if (!sources.num) {
 			obs_data_set_string(response_data, "error", "no source found");
 			obs_data_set_bool(response_data, "success", false);
+			release_source_array(&sources.da, sources.array, sources.num);
 			return;
 		}
 		for (size_t i = 0; i < sources.num; i++) {
 			success = start_replay_buffer_source(sources.array[i], request_data, response_data) && success;
 		}
-		da_free(sources);
+		release_source_array(&sources.da, sources.array, sources.num);
 	}
 	obs_data_set_bool(response_data, "success", success);
 }
 
+/* Vendor request: stop replay buffer for one source or all matching sources. */
 static void websocket_stop_replay_buffer(obs_data_t *request_data, obs_data_t *response_data, void *param)
 {
 	UNUSED_PARAMETER(param);
@@ -2374,16 +2713,18 @@ static void websocket_stop_replay_buffer(obs_data_t *request_data, obs_data_t *r
 		if (!sources.num) {
 			obs_data_set_string(response_data, "error", "no source found");
 			obs_data_set_bool(response_data, "success", false);
+			release_source_array(&sources.da, sources.array, sources.num);
 			return;
 		}
 		for (size_t i = 0; i < sources.num; i++) {
 			success = stop_replay_buffer_source(sources.array[i], request_data, response_data) && success;
 		}
-		da_free(sources);
+		release_source_array(&sources.da, sources.array, sources.num);
 	}
 	obs_data_set_bool(response_data, "success", success);
 }
 
+/* Vendor request: save replay buffer for one source or all matching sources. */
 static void websocket_save_replay_buffer(obs_data_t *request_data, obs_data_t *response_data, void *param)
 {
 	UNUSED_PARAMETER(param);
@@ -2405,16 +2746,18 @@ static void websocket_save_replay_buffer(obs_data_t *request_data, obs_data_t *r
 		if (!sources.num) {
 			obs_data_set_string(response_data, "error", "no source found");
 			obs_data_set_bool(response_data, "success", false);
+			release_source_array(&sources.da, sources.array, sources.num);
 			return;
 		}
 		for (size_t i = 0; i < sources.num; i++) {
 			success = save_replay_buffer_source(sources.array[i], request_data, response_data) && success;
 		}
-		da_free(sources);
+		release_source_array(&sources.da, sources.array, sources.num);
 	}
 	obs_data_set_bool(response_data, "success", success);
 }
 
+/* Enables per-source stream mode, applying optional server/key overrides. */
 static bool start_stream_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
 {
 	obs_source_t *filter = get_source_record_filter(source, request_data, response_data, true);
@@ -2439,6 +2782,7 @@ static bool start_stream_source(obs_source_t *source, obs_data_t *request_data, 
 	return true;
 }
 
+/* Disables per-source stream mode. */
 static bool stop_stream_source(obs_source_t *source, obs_data_t *request_data, obs_data_t *response_data)
 {
 	obs_source_t *filter = get_source_record_filter(source, request_data, response_data, false);
@@ -2453,6 +2797,7 @@ static bool stop_stream_source(obs_source_t *source, obs_data_t *request_data, o
 	return true;
 }
 
+/* Vendor request: start stream for one source or all matching sources. */
 static void websocket_start_stream(obs_data_t *request_data, obs_data_t *response_data, void *param)
 {
 	UNUSED_PARAMETER(param);
@@ -2476,16 +2821,18 @@ static void websocket_start_stream(obs_data_t *request_data, obs_data_t *respons
 		if (!sources.num) {
 			obs_data_set_string(response_data, "error", "no source found");
 			obs_data_set_bool(response_data, "success", false);
+			release_source_array(&sources.da, sources.array, sources.num);
 			return;
 		}
 		for (size_t i = 0; i < sources.num; i++) {
 			success = start_stream_source(sources.array[i], request_data, response_data) && success;
 		}
-		da_free(sources);
+		release_source_array(&sources.da, sources.array, sources.num);
 	}
 	obs_data_set_bool(response_data, "success", success);
 }
 
+/* Vendor request: stop stream for one source or all matching sources. */
 static void websocket_stop_stream(obs_data_t *request_data, obs_data_t *response_data, void *param)
 {
 	UNUSED_PARAMETER(param);
@@ -2507,16 +2854,18 @@ static void websocket_stop_stream(obs_data_t *request_data, obs_data_t *response
 		if (!sources.num) {
 			obs_data_set_string(response_data, "error", "no source found");
 			obs_data_set_bool(response_data, "success", false);
+			release_source_array(&sources.da, sources.array, sources.num);
 			return;
 		}
 		for (size_t i = 0; i < sources.num; i++) {
 			success = stop_stream_source(sources.array[i], request_data, response_data) && success;
 		}
-		da_free(sources);
+		release_source_array(&sources.da, sources.array, sources.num);
 	}
 	obs_data_set_bool(response_data, "success", success);
 }
 
+/* Module entrypoint: register filter type and websocket vendor requests. */
 bool obs_module_load(void)
 {
 	blog(LOG_INFO, "[Source Record] loaded version %s", PROJECT_VERSION);
@@ -2540,6 +2889,7 @@ bool obs_module_load(void)
 	return true;
 }
 
+/* Post-load hook: resolves optional OBS symbols for cross-version compatibility. */
 void obs_module_post_load(void)
 {
 #ifdef _WIN32
@@ -2552,10 +2902,16 @@ void obs_module_post_load(void)
 			(bool (*)(obs_encoder_t *, uint32_t))os_dlsym(handle, "obs_encoder_set_frame_rate_divisor");
 		obs_encoder_set_gpu_scale_type_func =
 			(void (*)(obs_encoder_t *, enum obs_scale_type))os_dlsym(handle, "obs_encoder_set_gpu_scale_type");
+		obs_frontend_get_locale_string_func =
+			(const char *(*)(const char *))os_dlsym(handle, "obs_frontend_get_locale_string");
+		obs_view_add2_func =
+			(video_t *(*)(obs_view_t *, const struct obs_video_info *))os_dlsym(handle, "obs_view_add2");
+		obs_view_remove_func = (void (*)(obs_view_t *))os_dlsym(handle, "obs_view_remove");
 		os_dlclose(handle);
 	}
 }
 
+/* Module unload hook: release global dynamic arrays. */
 void obs_module_unload(void)
 {
 	da_free(source_record_filters);
