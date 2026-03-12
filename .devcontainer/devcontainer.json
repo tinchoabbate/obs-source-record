@@ -1,0 +1,47 @@
+{
+  "name": "obs-source-record-dev",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "remoteUser": "vscode",
+  "workspaceFolder": "/workspaces/obs-source-record",
+  "runArgs": [
+    "--cap-add=SYS_PTRACE",
+    "--security-opt=seccomp=unconfined"
+  ],
+  "containerEnv": {
+    "CCACHE_DIR": "/workspaces/obs-source-record/.ccache",
+    "CMAKE_BUILD_PARALLEL_LEVEL": "4"
+  },
+  "mounts": [
+    "source=obs-source-record-ccache,target=/workspaces/obs-source-record/.ccache,type=volume"
+  ],
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "cmake.generator": "Ninja",
+        "cmake.configureOnOpen": false,
+        "cmake.buildDirectory": "${workspaceFolder}/build/debug",
+        "C_Cpp.default.compileCommands": "${workspaceFolder}/build/debug/compile_commands.json",
+        "clangd.arguments": [
+          "--background-index",
+          "--compile-commands-dir=${workspaceFolder}/build/debug"
+        ],
+        "files.associations": {
+          "*.h": "c"
+        }
+      },
+      "extensions": [
+        "ms-vscode.cmake-tools",
+        "llvm-vs-code-extensions.vscode-clangd",
+        "ms-vscode.cpptools",
+        "ms-vscode.cpptools-extension-pack",
+        "ms-vscode.makefile-tools",
+        "eamodio.gitlens",
+        "yzhang.markdown-all-in-one"
+      ]
+    }
+  }
+}

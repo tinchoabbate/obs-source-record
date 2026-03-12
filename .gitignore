@@ -1,0 +1,21 @@
+*~
+.DS_Store
+/build/
+/build_*/
+/release/
+/installer/Output/
+
+.vscode
+.idea
+
+# ignore generated files
+*.generated.*
+**/.Brewfile.lock.json
+
+# local caches / generated Python
+.ccache/
+**/__pycache__/
+*.pyc
+
+# generated during configure/build
+version.h
