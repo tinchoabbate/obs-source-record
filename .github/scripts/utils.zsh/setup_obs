@@ -49,17 +49,16 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)unpack]}) )) {
   if [[ -d .git ]] {
     git config advice.detachedHead false
     git config remote.pluginbuild.url "${obs_repo:-https://github.com/obsproject/obs-studio.git}"
-    git config remote.pluginbuild.fetch "+refs/heads/${obs_branch:-master}:refs/remotes/origin/${obs_branch:-master}"
+    git config remote.pluginbuild.fetch "+refs/heads/*:refs/remotes/pluginbuild/*"
+    git config --add remote.pluginbuild.fetch "+refs/tags/*:refs/tags/*"
 
     git rev-parse -q --verify "${obs_hash}^{commit}" > /dev/null || git fetch pluginbuild
-    git checkout ${obs_branch:-master} -B ${product_name}
-    git reset --hard "${obs_hash}"
+    git checkout -B ${product_name} "${obs_hash}"
     log_status 'Found existing obs-studio repository.'
   } else {
     git clone "${obs_repo:-https://github.com/obsproject/obs-studio.git}" "${PWD}"
     git config advice.detachedHead false
-    git checkout -f "${obs_hash}" --
-    git checkout ${obs_branch:-master} -b ${product_name}
+    git checkout -B ${product_name} "${obs_hash}"
     log_status 'obs-studio checked out.'
   }
 
